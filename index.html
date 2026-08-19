@@ -853,7 +853,7 @@ function rebuild(){
   eff.done=new Set(state.done);
   eff.want=new Set(state.want);
 }
-function save(){Store.set(state);rebuild();}
+function save(){Store.set(state);rebuild();schedSync();}
 rebuild();
 Store.initIDB(st=>{if(st){state=Object.assign({},BLANK,st);rebuild();render();}});
 
@@ -899,6 +899,73 @@ function toggleWant(id){
   if(i>=0)state.want.splice(i,1);else state.want.push(id);
   save();toast(eff.want.has(id)?'Marked ⭐ — filter these on the Map':'Unmarked');
 }
+
+/* ---------- cross-device sync (GitHub 'sync' branch, AES-GCM encrypted) ---------- */
+const SYNC_API='https://api.github.com/repos/NoymanDBE/escrs2026/contents/state.json';
+let syncCfg=null,syncSha=null,syncT=null,syncBusy=false,syncLastPull=0,syncStatus='not configured';
+try{syncCfg=JSON.parse(localStorage.getItem('escrs26.sync'))||null;if(syncCfg&&syncCfg.token)syncStatus='configured';}catch(e){}
+const b64=u8=>{let s='';for(let i=0;i<u8.length;i+=0x8000)s+=String.fromCharCode.apply(null,u8.subarray(i,i+0x8000));return btoa(s);};
+const ub64=s=>{const b=atob(s),u=new Uint8Array(b.length);for(let i=0;i<b.length;i++)u[i]=b.charCodeAt(i);return u;};
+async function skey(pass,salt){
+  const km=await crypto.subtle.importKey('raw',new TextEncoder().encode(pass),'PBKDF2',false,['deriveKey']);
+  return crypto.subtle.deriveKey({name:'PBKDF2',salt,iterations:150000,hash:'SHA-256'},km,
+    {name:'AES-GCM',length:256},false,['encrypt','decrypt']);
+}
+async function senc(pass,obj){
+  const salt=crypto.getRandomValues(new Uint8Array(16)),iv=crypto.getRandomValues(new Uint8Array(12));
+  const k=await skey(pass,salt);
+  const ct=new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM',iv},k,new TextEncoder().encode(JSON.stringify(obj))));
+  return b64(salt)+'.'+b64(iv)+'.'+b64(ct);
+}
+async function sdec(pass,str){
+  const[s,i,c]=str.split('.').map(ub64);
+  const k=await skey(pass,s);
+  return JSON.parse(new TextDecoder().decode(await crypto.subtle.decrypt({name:'AES-GCM',iv:i},k,c)));
+}
+const syncReady=()=>syncCfg&&syncCfg.token&&syncCfg.pass&&window.crypto&&crypto.subtle&&window.fetch;
+const syncHeaders=()=>({'Authorization':'Bearer '+syncCfg.token,'Accept':'application/vnd.github+json'});
+async function syncPull(quiet){
+  if(!syncReady())return;
+  try{
+    syncStatus='pulling…';
+    const r=await fetch(SYNC_API+'?ref=sync&t='+Date.now(),{headers:syncHeaders()});
+    syncLastPull=Date.now();
+    if(r.status===404){syncStatus='connected — no cloud state yet';return;}
+    if(!r.ok){syncStatus='error '+r.status+(r.status===401?' — token invalid/expired':'');return;}
+    const j=await r.json();syncSha=j.sha;
+    const env=JSON.parse(new TextDecoder().decode(ub64(j.content.replace(/\n/g,''))));
+    if(!(env.ts>(state.ts||0))){syncStatus='up to date '+new Date().toLocaleTimeString();return;}
+    let data;
+    try{data=await sdec(syncCfg.pass,env.data);}catch(e){syncStatus='WRONG PASSPHRASE — not applied';return;}
+    const prefs=state.prefs;                       // prefs stay per-device
+    state=Object.assign({},BLANK,data,{prefs,ts:env.ts});
+    ['starI','starS','del','follow','custom','done','want'].forEach(k=>{if(!Array.isArray(state[k]))state[k]=[];});
+    Store.set(state);rebuild();render();
+    syncStatus='pulled '+new Date().toLocaleTimeString();
+    if(!quiet)toast('Synced from cloud');
+  }catch(e){syncStatus='offline — will retry';}
+}
+async function syncPush(){
+  if(!syncReady()||syncBusy)return;
+  syncBusy=true;
+  try{
+    syncStatus='pushing…';
+    const env={v:1,ts:state.ts||Date.now(),data:await senc(syncCfg.pass,Object.assign({},state,{prefs:undefined}))};
+    const body={message:'sync',branch:'sync',
+      content:btoa(unescape(encodeURIComponent(JSON.stringify(env))))};
+    if(syncSha)body.sha=syncSha;
+    let r=await fetch(SYNC_API,{method:'PUT',headers:syncHeaders(),body:JSON.stringify(body)});
+    if(r.status===409||r.status===422){   // stale sha — refetch and retry once
+      const g=await fetch(SYNC_API+'?ref=sync&t='+Date.now(),{headers:syncHeaders()});
+      if(g.ok){syncSha=(await g.json()).sha;body.sha=syncSha;
+        r=await fetch(SYNC_API,{method:'PUT',headers:syncHeaders(),body:JSON.stringify(body)});}
+    }
+    if(r.ok){syncSha=(await r.json()).content.sha;syncStatus='synced '+new Date().toLocaleTimeString();}
+    else syncStatus='push error '+r.status+(r.status===401?' — token invalid/expired':'');
+  }catch(e){syncStatus='offline — will retry';}
+  syncBusy=false;
+}
+function schedSync(){if(!syncReady())return;clearTimeout(syncT);syncT=setTimeout(syncPush,2500);}
 
 /* ---------- involvement + schedule ---------- */
 function involvement(it){
@@ -1433,6 +1500,13 @@ function settingsSheet(){
   <div class="btnrow"><button class="btn sm sec" id="s_do_imp">Import</button></div>
   <div class="sect" style="padding-left:0">Google Calendar</div>
   <div style="font-size:12.5px;color:var(--dim)">Open any talk, session or meeting → <b>+ GCal ↗</b> opens a pre-filled Google Calendar save screen (works on phone &amp; PC, uses your normal Google login in the browser).</div>
+  <div class="sect" style="padding-left:0">Cross-device sync</div>
+  <div class="kv" style="font-size:12px;color:var(--dim)">Status: ${esc(syncStatus)}</div>
+  <div class="kv"><b>GitHub token</b><input id="sy_t" type="password" value="${esc(syncCfg&&syncCfg.token||'')}" placeholder="fine-grained PAT · repo escrs2026 · Contents: RW"></div>
+  <div class="kv"><b>Passphrase</b><input id="sy_p" type="password" value="${esc(syncCfg&&syncCfg.pass||'')}" placeholder="same phrase on every device"></div>
+  <div class="btnrow"><button class="btn sm" id="sy_save">Save & sync now</button>
+  <button class="btn sm sec" id="sy_off">Disable</button></div>
+  <div style="font-size:12px;color:var(--dim)">Token: github.com → Settings → Developer settings → Fine-grained tokens → New: only repository <b>escrs2026</b>, permission <b>Contents: Read and write</b>, expiry after the trip. Your stars/meetings are AES-encrypted with the passphrase <b>before</b> upload — the repo only ever stores ciphertext. Enter the same token + passphrase on PC and phone; the app pulls on open and pushes ~3 s after every change (newest change wins).</div>
   <div class="sect" style="padding-left:0">Phone install</div>
   <div style="font-size:12.5px;color:var(--dim)">
   Open <b>https://noymandbe.github.io/escrs2026/</b> in Chrome → menu ⋮ → <b>Add to Home screen</b>.<br>
@@ -1448,6 +1522,21 @@ function settingsSheet(){
       if(!st||st.v!==1)throw new Error('bad');
       state=Object.assign({},BLANK,st);save();closeSheet();render();toast('Imported');}
     catch(e){toast('Invalid backup JSON');}});
+  $('#sy_save').addEventListener('click',async()=>{
+    const t=$('#sy_t').value.trim(),p=$('#sy_p').value.trim();
+    if(!t||!p){toast('Need both token and passphrase');return;}
+    syncCfg={token:t,pass:p};syncSha=null;
+    try{localStorage.setItem('escrs26.sync',JSON.stringify(syncCfg));}catch(e){}
+    closeSheet();toast('Connecting…');
+    await syncPull(true);
+    await syncPush();
+    toast('Sync: '+syncStatus);
+  });
+  $('#sy_off').addEventListener('click',()=>{
+    syncCfg=null;syncSha=null;syncStatus='not configured';
+    try{localStorage.removeItem('escrs26.sync');}catch(e){}
+    closeSheet();toast('Sync disabled (local data kept)');
+  });
 }
 $('#gear').addEventListener('click',settingsSheet);
 $('#pill').addEventListener('click',settingsSheet);
@@ -1541,10 +1630,14 @@ render();
 if('serviceWorker' in navigator&&location.protocol==='https:'){
   try{navigator.serviceWorker.register('sw.js');}catch(e){}
 }
+syncPull(true);
+document.addEventListener('visibilitychange',()=>{
+  if(document.visibilityState==='visible'&&Date.now()-syncLastPull>60000)syncPull(true);
+});
 /* test hook (harmless in production) */
 window.__T={D,state:()=>state,eff:()=>eff,entriesFor,involvement,toggleStarItem,toggleStarSess,
 toggleFollow,personItems,setTab,progSet:(q,d,t,s)=>{progQ=q;progDay=d;progType=t;progScope=s||'talks';progShown=60;},
-progResults,Store,render,customAdd:c=>{state.custom.push(c);save();},keyOf:pKeyOf,pName};
+progResults,Store,render,customAdd:c=>{state.custom.push(c);save();},keyOf:pKeyOf,pName,senc,sdec};
 </script>
 </body>
 </html>
